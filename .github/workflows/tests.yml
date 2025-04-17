@@ -9,10 +9,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Go
-        uses: actions/setup-go@b6d1146afeb9d50ec8c478c9a76c3c1a7b9bbaab
+        uses: actions/setup-go@bfdd3570ce990073878bf10f6b2d79082de49492
         with:
           go-version: ${{ matrix.go-version }}
       - name: Checkout code
-        uses: actions/checkout@a4f56d5aa6a301083841b57b0c5e5b5e2e6f9fd6
+        uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2
       - name: Test
         run: go test ./... -count=100
