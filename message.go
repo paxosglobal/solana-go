@@ -84,6 +84,7 @@ type MessageVersion int
 const (
 	MessageVersionLegacy MessageVersion = 0 // default
 	MessageVersionV0     MessageVersion = 1 // v0
+	MessageVersionV1     MessageVersion = 2 // v1 (SIMD-0385)
 )
 
 type Message struct {
@@ -104,8 +105,11 @@ type Message struct {
 	// and committed in one atomic transaction if all succeed.
 	Instructions []CompiledInstruction `json:"instructions"`
 
-	// List of address table lookups used to load additional accounts for this transaction.
+	// List of address table lookups used to load additional accounts for this transaction (v0 only).
 	AddressTableLookups MessageAddressTableLookupSlice `json:"addressTableLookups"`
+
+	// Inline compute budget carried by v1 messages (SIMD-0385). Empty for legacy and v0.
+	TransactionConfig TransactionConfig `json:"transactionConfig"`
 
 	// The actual tables that contain the list of account pubkeys.
 	// NOTE: you need to fetch these from the chain, and then call `SetAddressTables`
@@ -280,6 +284,8 @@ func (mx *Message) MarshalBinary() ([]byte, error) {
 	switch mx.version {
 	case MessageVersionV0:
 		return mx.MarshalV0()
+	case MessageVersionV1:
+		return mx.MarshalV1()
 	case MessageVersionLegacy:
 		return mx.MarshalLegacy()
 	default:
@@ -382,20 +388,26 @@ func (mx Message) ToBase64() string {
 }
 
 func (mx *Message) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
-	// peek first byte to determine if this is a legacy or v0 message
+	// Peek the first byte to determine the message version. A byte with the
+	// high bit set is versioned (0x81 = v1, otherwise v0); without it, the byte
+	// is a legacy message's numRequiredSignatures.
 	versionNum, err := decoder.Peek(1)
 	if err != nil {
 		return err
 	}
-	// TODO: is this the right way to determine if this is a legacy or v0 message?
-	if versionNum[0] < 127 {
+	switch {
+	case versionNum[0]&messageVersionPrefix == 0:
 		mx.version = MessageVersionLegacy
-	} else {
+	case versionNum[0] == messageVersionV1Prefix:
+		mx.version = MessageVersionV1
+	default:
 		mx.version = MessageVersionV0
 	}
 	switch mx.version {
 	case MessageVersionV0:
 		return mx.UnmarshalV0(decoder)
+	case MessageVersionV1:
+		return mx.UnmarshalV1(decoder)
 	case MessageVersionLegacy:
 		return mx.UnmarshalLegacy(decoder)
 	default:

@@ -484,6 +484,20 @@ func (tx *Transaction) MarshalBinary() ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode tx.Message to binary: %w", err)
 	}
 
+	if tx.Message.version == MessageVersionV1 {
+		// V1 wire order is the prefixed message followed by exactly
+		// numRequiredSignatures signatures, with no length prefix.
+		if numRequired := int(tx.Message.Header.NumRequiredSignatures); len(tx.Signatures) > numRequired {
+			return nil, fmt.Errorf("v1 transaction: %d signatures but header requires %d (the v1 wire format has no signature count)", len(tx.Signatures), numRequired)
+		}
+		output := make([]byte, 0, len(messageContent)+len(tx.Signatures)*64)
+		output = append(output, messageContent...)
+		for _, sig := range tx.Signatures {
+			output = append(output, sig[:]...)
+		}
+		return output, nil
+	}
+
 	var signatureCount []byte
 	bin.EncodeCompactU16Length(&signatureCount, len(tx.Signatures))
 	output := make([]byte, 0, len(signatureCount)+len(signatureCount)*64+len(messageContent))
@@ -505,6 +519,19 @@ func (tx Transaction) MarshalWithEncoder(encoder *bin.Encoder) error {
 }
 
 func (tx *Transaction) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
+	// The first byte is a compact-u16 signature count (high bit clear) for
+	// legacy/v0 transactions, or the v1 message prefix (0x81) for a v1
+	// transaction, whose envelope carries the message before its signatures.
+	first, err := decoder.Peek(1)
+	if err != nil {
+		return fmt.Errorf("unable to peek transaction discriminator: %w", err)
+	}
+	if first[0] == messageVersionV1Prefix {
+		return tx.unmarshalV1(decoder)
+	}
+	if first[0]&messageVersionPrefix != 0 {
+		return fmt.Errorf("invalid transaction discriminator: 0x%02x", first[0])
+	}
 	{
 		numSignatures, err := decoder.ReadCompactU16()
 		if err != nil {
@@ -529,6 +556,28 @@ func (tx *Transaction) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
 		err := tx.Message.UnmarshalWithDecoder(decoder)
 		if err != nil {
 			return fmt.Errorf("unable to decode tx.Message: %w", err)
+		}
+	}
+	return nil
+}
+
+// unmarshalV1 decodes a v1 transaction: the prefixed message followed by
+// exactly numRequiredSignatures signatures (SIMD-0385).
+func (tx *Transaction) unmarshalV1(decoder *bin.Decoder) error {
+	if err := tx.Message.UnmarshalV1(decoder); err != nil {
+		return fmt.Errorf("unable to decode tx.Message: %w", err)
+	}
+	numSignatures := int(tx.Message.Header.NumRequiredSignatures)
+	if numSignatures > len(tx.Message.AccountKeys) {
+		return fmt.Errorf("v1 transaction: header requires %d signatures but only %d account keys", numSignatures, len(tx.Message.AccountKeys))
+	}
+	if numSignatures*64 > decoder.Remaining() {
+		return fmt.Errorf("v1 transaction: header requires %d signatures (%d bytes) but only %d bytes remain", numSignatures, numSignatures*64, decoder.Remaining())
+	}
+	tx.Signatures = make([]Signature, numSignatures)
+	for i := range tx.Signatures {
+		if _, err := decoder.Read(tx.Signatures[i][:]); err != nil {
+			return fmt.Errorf("unable to read tx.Signatures[%d]: %w", i, err)
 		}
 	}
 	return nil
