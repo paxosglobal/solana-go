@@ -35,17 +35,17 @@ import (
 
 var ErrSubscriptionClosed = errors.New("subscription closed")
 
-type result interface{}
+type result any
 
 type Client struct {
 	rpcURL                  string
 	conn                    *websocket.Conn
 	connCtx                 context.Context
 	connCtxCancel           context.CancelFunc
+	wg                      sync.WaitGroup
 	lock                    sync.RWMutex
 	subscriptionByRequestID map[uint64]*Subscription
 	subscriptionByWSSubID   map[uint64]*Subscription
-	reconnectOnErr          bool
 	shortID                 bool
 }
 
@@ -105,10 +105,13 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 	}
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
+	c.wg.Add(2)
 	go func() {
+		defer c.wg.Done()
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-c.connCtx.Done():
@@ -132,14 +135,20 @@ func (c *Client) sendPing() {
 	}
 }
 
+// Close cancels the connection context, closes the underlying websocket
+// connection, and waits for background goroutines to finish.
 func (c *Client) Close() {
 	c.lock.Lock()
-	defer c.lock.Unlock()
 	c.connCtxCancel()
 	c.conn.Close()
+	c.lock.Unlock()
+	c.wg.Wait()
 }
 
 func (c *Client) receiveMessages() {
+	defer c.wg.Done()
+	defer c.closeAllSubscription(ErrSubscriptionClosed)
+
 	for {
 		select {
 		case <-c.connCtx.Done():
@@ -147,7 +156,6 @@ func (c *Client) receiveMessages() {
 		default:
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
-				c.closeAllSubscription(err)
 				return
 			}
 			c.handleMessage(message)
@@ -162,10 +170,12 @@ func getUint64(data []byte, keys ...string) (val uint64, err error) {
 	if e != nil {
 		return 0, e
 	}
-	if t != jsonparser.Number {
-		return 0, fmt.Errorf("Value is not a number: %s", string(v))
+	switch t {
+	case jsonparser.Number, jsonparser.String:
+		return strconv.ParseUint(string(v), 10, 64)
+	default:
+		return 0, fmt.Errorf("value is not a number/string: type=%d data=%s", t, string(v))
 	}
-	return strconv.ParseUint(string(v), 10, 64)
 }
 
 func getUint64WithOk(data []byte, path ...string) (uint64, bool) {
@@ -176,12 +186,37 @@ func getUint64WithOk(data []byte, path ...string) (uint64, bool) {
 	return 0, false
 }
 
+// getRPCErrorWithOk extracts a JSON-RPC error object from a response message.
+// A reply such as
+//
+//	{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":7534392980301594513}
+//
+// carries an `id` but no `result`, so it must be detected before the result is
+// read. The boolean reports whether an error object was present.
+func getRPCErrorWithOk(message []byte) (error, bool) {
+	errObj, dataType, _, err := jsonparser.Get(message, "error")
+	if err != nil || dataType != jsonparser.Object {
+		return nil, false
+	}
+	code, _ := jsonparser.GetInt(errObj, "code")
+	msg, _ := jsonparser.GetString(errObj, "message")
+	return fmt.Errorf("rpc error (code %d): %s", code, msg), true
+}
+
 func (c *Client) handleMessage(message []byte) {
 	// when receiving message with id. the result will be a subscription number.
 	// that number will be associated to all future message destine to this request
 
 	requestID, ok := getUint64WithOk(message, "id")
 	if ok {
+		// A reply carrying an id but an error object is a failed
+		// subscribe/unsubscribe request. Surface the error to the caller
+		// instead of registering a subscription whose result never arrives,
+		// which would otherwise leave Recv blocked forever.
+		if rpcErr, hasErr := getRPCErrorWithOk(message); hasErr {
+			c.closeSubscription(requestID, rpcErr)
+			return
+		}
 		subID, _ := getUint64WithOk(message, "result")
 		c.handleNewSubscriptionMessage(requestID, subID)
 		return
@@ -218,7 +253,6 @@ func (c *Client) handleNewSubscriptionMessage(requestID, subID uint64) {
 		zap.Uint64("request_id", requestID),
 		zap.Int("subscription_count", len(c.subscriptionByWSSubID)),
 	)
-	return
 }
 
 func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
@@ -239,7 +273,6 @@ func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
 	// Decode the message using the subscription-provided decoderFunc.
 	result, err := sub.decoderFunc(message)
 	if err != nil {
-		fmt.Println("*****************************")
 		c.closeSubscription(sub.req.ID, fmt.Errorf("unable to decode client response: %w", err))
 		return
 	}
@@ -247,17 +280,18 @@ func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
 	// this cannot be blocking or else
 	// we  will no read any other message
 	if len(sub.stream) >= cap(sub.stream) {
-		zlog.Warn("closing ws client subscription... not consuming fast en ought",
+		zlog.Warn("closing ws client subscription... not consuming fast enough",
 			zap.Uint64("request_id", sub.req.ID),
 		)
 		c.closeSubscription(sub.req.ID, fmt.Errorf("reached channel max capacity %d", len(sub.stream)))
 		return
 	}
 
+	sub.mu.Lock()
 	if !sub.closed {
 		sub.stream <- result
 	}
-	return
+	sub.mu.Unlock()
 }
 
 func (c *Client) closeAllSubscription(err error) {
@@ -265,7 +299,17 @@ func (c *Client) closeAllSubscription(err error) {
 	defer c.lock.Unlock()
 
 	for _, sub := range c.subscriptionByRequestID {
-		sub.err <- err
+		sub.mu.Lock()
+		if !sub.closed {
+			select {
+			case sub.err <- err:
+			default:
+			}
+			sub.closed = true
+			close(sub.stream)
+			close(sub.err)
+		}
+		sub.mu.Unlock()
 	}
 
 	c.subscriptionByRequestID = map[uint64]*Subscription{}
@@ -281,13 +325,27 @@ func (c *Client) closeSubscription(reqID uint64, err error) {
 		return
 	}
 
-	sub.err <- err
+	sub.mu.Lock()
+	if !sub.closed {
+		select {
+		case sub.err <- err:
+		default:
+		}
+		sub.closed = true
+		close(sub.stream)
+		close(sub.err)
+	}
+	sub.mu.Unlock()
 
-	err = c.unsubscribe(sub.subID, sub.unsubscribeMethod)
-	if err != nil {
-		zlog.Warn("unable to send rpc unsubscribe call",
-			zap.Error(err),
-		)
+	// subID stays 0 when the subscription request itself failed (e.g. the
+	// server returned an error response); there is nothing to unsubscribe in
+	// that case, so don't send a bogus unsubscribe for subID 0.
+	if sub.subID != 0 {
+		if e := c.unsubscribe(sub.subID, sub.unsubscribeMethod); e != nil {
+			zlog.Warn("unable to send rpc unsubscribe call",
+				zap.Error(e),
+			)
+		}
 	}
 
 	delete(c.subscriptionByRequestID, sub.req.ID)
@@ -295,7 +353,7 @@ func (c *Client) closeSubscription(reqID uint64, err error) {
 }
 
 func (c *Client) unsubscribe(subID uint64, method string) error {
-	req := newRequest([]interface{}{subID}, method, nil, c.shortID)
+	req := newRequest([]any{subID}, method, nil, c.shortID)
 	data, err := req.encode()
 	if err != nil {
 		return fmt.Errorf("unable to encode unsubscription message for subID %d and method %s", subID, method)
@@ -310,8 +368,8 @@ func (c *Client) unsubscribe(subID uint64, method string) error {
 }
 
 func (c *Client) subscribe(
-	params []interface{},
-	conf map[string]interface{},
+	params []any,
+	conf map[string]any,
 	subscriptionMethod string,
 	unsubscribeMethod string,
 	decoderFunc decoderFunc,
@@ -348,7 +406,7 @@ func (c *Client) subscribe(
 	return sub, nil
 }
 
-func decodeResponseFromReader(r io.Reader, reply interface{}) (err error) {
+func decodeResponseFromReader(r io.Reader, reply any) (err error) {
 	var c *response
 	if err := json.NewDecoder(r).Decode(&c); err != nil {
 		return err
@@ -372,7 +430,7 @@ func decodeResponseFromReader(r io.Reader, reply interface{}) (err error) {
 	return json.Unmarshal(*c.Params.Result, &reply)
 }
 
-func decodeResponseFromMessage(r []byte, reply interface{}) (err error) {
+func decodeResponseFromMessage(r []byte, reply any) (err error) {
 	var c *response
 	if err := json.Unmarshal(r, &c); err != nil {
 		return err

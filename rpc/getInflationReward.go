@@ -26,6 +26,9 @@ type GetInflationRewardOpts struct {
 	// An epoch for which the reward occurs.
 	// If omitted, the previous epoch will be used.
 	Epoch *uint64
+
+	// The minimum slot that the request can be evaluated at.
+	MinContextSlot *uint64
 }
 
 // GetInflationReward returns the inflation / staking reward for a list of addresses for an epoch.
@@ -38,7 +41,7 @@ func (cl *Client) GetInflationReward(
 	opts *GetInflationRewardOpts,
 
 ) (out []*GetInflationRewardResult, err error) {
-	params := []interface{}{addresses}
+	params := []any{addresses}
 	if opts != nil {
 		obj := M{}
 		if opts.Commitment != "" {
@@ -46,6 +49,9 @@ func (cl *Client) GetInflationReward(
 		}
 		if opts.Epoch != nil {
 			obj["epoch"] = opts.Epoch
+		}
+		if opts.MinContextSlot != nil {
+			obj["minContextSlot"] = *opts.MinContextSlot
 		}
 		if len(obj) > 0 {
 			params = append(params, obj)
@@ -57,7 +63,7 @@ func (cl *Client) GetInflationReward(
 }
 
 type GetInflationRewardResult struct {
-	// Epoch for which reward occured.
+	// Epoch for which reward occurred.
 	Epoch uint64 `json:"epoch"`
 
 	// The slot in which the rewards are effective.
@@ -71,4 +77,7 @@ type GetInflationRewardResult struct {
 
 	// Vote account commission when the reward was credited.
 	Commission *uint8 `json:"commission,omitempty"`
+
+	// Vote account commission in basis points when the reward was credited.
+	CommissionBps *uint16 `json:"commissionBps,omitempty"`
 }

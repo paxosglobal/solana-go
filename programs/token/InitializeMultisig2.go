@@ -32,7 +32,7 @@ type InitializeMultisig2 struct {
 	// [0] = [WRITE] account
 	// ··········· The multisignature account to initialize.
 	//
-	// [1] = [SIGNER] signers
+	// [1] = [] signers
 	// ··········· The signer accounts, must equal to N where 1 <= N <= 11.
 	Accounts ag_solanago.AccountMetaSlice `bin:"-" borsh_skip:"true"`
 	Signers  ag_solanago.AccountMetaSlice `bin:"-" borsh_skip:"true"`
@@ -82,14 +82,14 @@ func (inst *InitializeMultisig2) GetAccount() *ag_solanago.AccountMeta {
 // The signer accounts, must equal to N where 1 <= N <= 11.
 func (inst *InitializeMultisig2) AddSigners(signers ...ag_solanago.PublicKey) *InitializeMultisig2 {
 	for _, signer := range signers {
-		inst.Signers = append(inst.Signers, ag_solanago.Meta(signer).SIGNER())
+		inst.Signers = append(inst.Signers, ag_solanago.Meta(signer))
 	}
 	return inst
 }
 
 func (inst InitializeMultisig2) Build() *Instruction {
 	return &Instruction{BaseVariant: ag_binary.BaseVariant{
-		Impl:   inst,
+		Impl:   &inst,
 		TypeID: ag_binary.TypeIDFromUint8(Instruction_InitializeMultisig2),
 	}}
 }
@@ -108,7 +108,7 @@ func (inst *InitializeMultisig2) Validate() error {
 	// Check whether all (required) parameters are set:
 	{
 		if inst.M == nil {
-			return errors.New("M parameter is not set")
+			return errors.New("m parameter is not set")
 		}
 	}
 

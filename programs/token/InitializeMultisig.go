@@ -47,7 +47,7 @@ type InitializeMultisig struct {
 	// [1] = [] $(SysVarRentPubkey)
 	// ··········· Rent sysvar.
 	//
-	// [2...] = [SIGNER] signers
+	// [2...] = [] signers
 	// ··········· ..2+N The signer accounts, must equal to N where 1 <= N <=11
 	Accounts ag_solanago.AccountMetaSlice `bin:"-" borsh_skip:"true"`
 	Signers  ag_solanago.AccountMetaSlice `bin:"-" borsh_skip:"true"`
@@ -112,14 +112,14 @@ func (inst *InitializeMultisig) GetSysVarRentPubkeyAccount() *ag_solanago.Accoun
 // ..2+N The signer accounts, must equal to N where 1 <= N <=11
 func (inst *InitializeMultisig) AddSigners(signers ...ag_solanago.PublicKey) *InitializeMultisig {
 	for _, signer := range signers {
-		inst.Signers = append(inst.Signers, ag_solanago.Meta(signer).SIGNER())
+		inst.Signers = append(inst.Signers, ag_solanago.Meta(signer))
 	}
 	return inst
 }
 
 func (inst InitializeMultisig) Build() *Instruction {
 	return &Instruction{BaseVariant: ag_binary.BaseVariant{
-		Impl:   inst,
+		Impl:   &inst,
 		TypeID: ag_binary.TypeIDFromUint8(Instruction_InitializeMultisig),
 	}}
 }
@@ -138,7 +138,7 @@ func (inst *InitializeMultisig) Validate() error {
 	// Check whether all (required) parameters are set:
 	{
 		if inst.M == nil {
-			return errors.New("M parameter is not set")
+			return errors.New("m parameter is not set")
 		}
 	}
 

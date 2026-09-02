@@ -19,17 +19,17 @@ package rpc
 
 import (
 	"encoding/base64"
-	stdjson "encoding/json"
 	"fmt"
 	"math/big"
 
 	bin "github.com/gagliardetto/binary"
-
 	"github.com/gagliardetto/solana-go"
+	stdjson "github.com/goccy/go-json"
 )
 
 type Context struct {
-	Slot uint64 `json:"slot"`
+	Slot       uint64  `json:"slot"`
+	ApiVersion *string `json:"apiVersion,omitempty"`
 }
 
 type RPCContext struct {
@@ -41,31 +41,13 @@ type GetBalanceResult struct {
 	Value uint64 `json:"value"`
 }
 
-type GetRecentBlockhashResult struct {
+type GetStakeMinimumDelegationResult struct {
 	RPCContext
-	Value *BlockhashResult `json:"value"`
-}
-
-type BlockhashResult struct {
-	Blockhash     solana.Hash   `json:"blockhash"`
-	FeeCalculator FeeCalculator `json:"feeCalculator"`
+	Value uint64 `json:"value"`
 }
 
 type FeeCalculator struct {
 	LamportsPerSignature uint64 `json:"lamportsPerSignature"`
-}
-
-type GetConfirmedBlockResult struct {
-	Blockhash solana.Hash `json:"blockhash"`
-
-	// could be zeroes if ledger was clean-up and this is unavailable
-	PreviousBlockhash solana.Hash `json:"previousBlockhash"`
-
-	ParentSlot   uint64                  `json:"parentSlot"`
-	Transactions []TransactionWithMeta   `json:"transactions"`
-	Signatures   []solana.Signature      `json:"signatures"`
-	Rewards      []BlockReward           `json:"rewards"`
-	BlockTime    *solana.UnixTimeSeconds `json:"blockTime,omitempty"`
 }
 
 type BlockReward struct {
@@ -134,13 +116,77 @@ func (twm TransactionWithMeta) MustGetTransaction() *solana.Transaction {
 }
 
 func (twm TransactionWithMeta) GetTransaction() (*solana.Transaction, error) {
+	if twm.Transaction == nil {
+		return nil, fmt.Errorf("transaction is nil")
+	}
+	// EncodingJSON: the RPC returned a JSON object — unmarshal directly.
+	if raw := twm.Transaction.GetRawJSON(); raw != nil {
+		var tx solana.Transaction
+		if err := json.Unmarshal(raw, &tx); err != nil {
+			return nil, err
+		}
+		if tx.Message.AccountKeys == nil {
+			return nil, fmt.Errorf("transaction has no message: block may have been fetched with transactionDetails=accounts; use GetAccountKeys instead")
+		}
+		return &tx, nil
+	}
 	tx := new(solana.Transaction)
-	err := tx.UnmarshalWithDecoder(bin.NewBinDecoder(twm.Transaction.GetBinary()))
-	if err != nil {
+	if err := tx.UnmarshalWithDecoder(bin.NewBinDecoder(twm.Transaction.GetBinary())); err != nil {
 		return nil, err
 	}
 	return tx, nil
 }
+
+// GetAccountKeys returns the account keys when the block was fetched with
+// TransactionDetailsAccounts. In this mode the transaction field contains
+// {"signatures": [...], "accountKeys": [...]} instead of the full encoded transaction.
+func (twm TransactionWithMeta) GetAccountKeys() (*TransactionAccountKeys, error) {
+	if twm.Transaction == nil {
+		return nil, fmt.Errorf("transaction is nil")
+	}
+	raw := twm.Transaction.GetRawJSON()
+	if raw == nil {
+		return nil, fmt.Errorf("transaction is not JSON (accounts mode requires transactionDetails=accounts)")
+	}
+	var out TransactionAccountKeys
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal account keys: %w", err)
+	}
+	return &out, nil
+}
+
+// TransactionAccountKeys is the transaction representation returned when
+// transactionDetails is "accounts". Instead of the full message, it contains
+// only the signatures and the list of account keys with their roles.
+type TransactionAccountKeys struct {
+	Signatures  []solana.Signature `json:"signatures"`
+	AccountKeys []AccountKey       `json:"accountKeys"`
+}
+
+// AccountKey represents a single account involved in a transaction,
+// as returned in the "accounts" transaction detail mode.
+type AccountKey struct {
+	// The account's public key.
+	Pubkey solana.PublicKey `json:"pubkey"`
+
+	// Whether this account signed the transaction.
+	Signer bool `json:"signer"`
+
+	// Whether the transaction marks this account as writable.
+	Writable bool `json:"writable"`
+
+	// The source of the account key: "transaction" for keys from the
+	// message itself, "lookupTable" for keys resolved from address
+	// lookup tables. Nil for legacy transactions.
+	Source *AccountKeySource `json:"source,omitempty"`
+}
+
+type AccountKeySource string
+
+const (
+	AccountKeySourceTransaction AccountKeySource = "transaction"
+	AccountKeySourceLookupTable AccountKeySource = "lookupTable"
+)
 
 type TransactionParsed struct {
 	Meta        *TransactionMeta    `json:"meta,omitempty"`
@@ -184,7 +230,7 @@ type LoadedAddresses struct {
 type TransactionMeta struct {
 	// Error if transaction failed, null if transaction succeeded.
 	// https://github.com/solana-labs/solana/blob/master/sdk/src/transaction.rs#L24
-	Err interface{} `json:"err"`
+	Err any `json:"err"`
 
 	// Fee this transaction was charged
 	Fee uint64 `json:"fee"`
@@ -234,7 +280,24 @@ type InnerInstruction struct {
 	Index uint16 `json:"index"`
 
 	// Ordered list of inner program instructions that were invoked during a single transaction instruction.
-	Instructions []solana.CompiledInstruction `json:"instructions"`
+	Instructions []CompiledInstruction `json:"instructions"`
+}
+
+type CompiledInstruction struct {
+	// Index into the message.accountKeys array indicating the program account that executes this instruction.
+	// NOTE: it is actually a uint8, but using a uint16 because uint8 is treated as a byte everywhere,
+	// and that can be an issue.
+	ProgramIDIndex uint16 `json:"programIdIndex"`
+
+	// List of ordered indices into the message.accountKeys array indicating which accounts to pass to the program.
+	// NOTE: it is actually a []uint8, but using a uint16 because []uint8 is treated as a []byte everywhere,
+	// and that can be an issue.
+	Accounts []uint16 `json:"accounts"`
+
+	// The program input data encoded in a base-58 string.
+	Data solana.Base58 `json:"data"`
+
+	StackHeight uint16 `json:"stackHeight"`
 }
 
 // Ok  interface{} `json:"Ok"`  // <null> Transaction was successful
@@ -243,7 +306,7 @@ type DeprecatedTransactionMetaStatus M
 
 type TransactionSignature struct {
 	// Error if transaction failed, nil if transaction succeeded.
-	Err interface{} `json:"err"`
+	Err any `json:"err"`
 
 	// Memo associated with the transaction, nil if no memo is present.
 	Memo *string `json:"memo"`
@@ -259,6 +322,9 @@ type TransactionSignature struct {
 	BlockTime *solana.UnixTimeSeconds `json:"blockTime,omitempty"`
 
 	ConfirmationStatus ConfirmationStatusType `json:"confirmationStatus,omitempty"`
+
+	// The transaction's index within the block.
+	TransactionIndex *uint32 `json:"transactionIndex,omitempty"`
 }
 
 type GetAccountInfoResult struct {
@@ -305,6 +371,9 @@ type Account struct {
 
 	// The epoch at which this account will next owe rent
 	RentEpoch *big.Int `json:"rentEpoch"`
+
+	// The amount of storage space required to store the token account
+	Space uint64 `json:"space"`
 }
 
 type DataBytesOrJSON struct {
@@ -376,6 +445,9 @@ func (wrap *DataBytesOrJSON) UnmarshalJSON(data []byte) error {
 // GetBinary returns the decoded bytes if the encoding is
 // "base58", "base64", or "base64+zstd".
 func (dt *DataBytesOrJSON) GetBinary() []byte {
+	if dt == nil {
+		return nil
+	}
 	return dt.asDecodedBinary.Content
 }
 
@@ -401,23 +473,28 @@ type GetProgramAccountsOpts struct {
 	// Filter results using various filter objects;
 	// account must meet all filter criteria to be included in results.
 	Filters []RPCFilter `json:"filters,omitempty"`
+
+	// Wrap the result in an RpcResponse JSON object with context.
+	WithContext *bool `json:"withContext,omitempty"`
+
+	// Sort the results (useful for deterministic pagination).
+	SortResults *bool `json:"sortResults,omitempty"`
+
+	// The minimum slot that the request can be evaluated at.
+	MinContextSlot *uint64 `json:"minContextSlot,omitempty"`
 }
 
 type GetProgramAccountsResult []*KeyedAccount
+
+type GetProgramAccountsWithContextResult struct {
+	RPCContext
+	Value GetProgramAccountsResult `json:"value"`
+}
 
 type KeyedAccount struct {
 	Pubkey  solana.PublicKey `json:"pubkey"`
 	Account *Account         `json:"account"`
 }
-
-type GetConfirmedSignaturesForAddress2Opts struct {
-	Limit      *uint64          `json:"limit,omitempty"`
-	Before     solana.Signature `json:"before,omitempty"`
-	Until      solana.Signature `json:"until,omitempty"`
-	Commitment CommitmentType   `json:"commitment,omitempty"`
-}
-
-type GetConfirmedSignaturesForAddress2Result []*TransactionSignature
 
 type RPCFilter struct {
 	Memcmp   *RPCFilterMemcmp `json:"memcmp,omitempty"`
@@ -432,12 +509,6 @@ type RPCFilterMemcmp struct {
 type CommitmentType string
 
 const (
-	CommitmentMax          CommitmentType = "max"          // Deprecated as of v1.5.5
-	CommitmentRecent       CommitmentType = "recent"       // Deprecated as of v1.5.5
-	CommitmentRoot         CommitmentType = "root"         // Deprecated as of v1.5.5
-	CommitmentSingle       CommitmentType = "single"       // Deprecated as of v1.5.5
-	CommitmentSingleGossip CommitmentType = "singleGossip" // Deprecated as of v1.5.5
-
 	// The node will query the most recent block confirmed by supermajority
 	// of the cluster as having reached maximum lockout,
 	// meaning the cluster has recognized this block as finalized.
@@ -461,7 +532,7 @@ type ParsedTransaction struct {
 type ParsedTransactionMeta struct {
 	// Error if transaction failed, null if transaction succeeded.
 	// https://github.com/solana-labs/solana/blob/master/sdk/src/transaction.rs#L24
-	Err interface{} `json:"err"`
+	Err any `json:"err"`
 
 	// Fee this transaction was charged
 	Fee uint64 `json:"fee"`
@@ -487,6 +558,17 @@ type ParsedTransactionMeta struct {
 	// Array of string log messages or omitted if log message
 	// recording was not yet enabled during this transaction
 	LogMessages []string `json:"logMessages"`
+
+	// DEPRECATED: Transaction status.
+	Status DeprecatedTransactionMetaStatus `json:"status"`
+
+	Rewards []BlockReward `json:"rewards"`
+
+	LoadedAddresses LoadedAddresses `json:"loadedAddresses"`
+
+	ReturnData ReturnData `json:"returnData"`
+
+	ComputeUnitsConsumed *uint64 `json:"computeUnitsConsumed"`
 }
 
 type ParsedInnerInstruction struct {
@@ -504,6 +586,10 @@ type ParsedMessage struct {
 	AccountKeys     []ParsedMessageAccount `json:"accountKeys"`
 	Instructions    []*ParsedInstruction   `json:"instructions"`
 	RecentBlockHash string                 `json:"recentBlockhash"`
+
+	// Inline compute budget configuration; only present for v1 (SIMD-0385)
+	// transactions.
+	TransactionConfig *solana.TransactionConfig `json:"transactionConfig,omitempty"`
 }
 
 type ParsedInstruction struct {
@@ -521,8 +607,8 @@ type InstructionInfoEnvelope struct {
 }
 
 type InstructionInfo struct {
-	Info            map[string]interface{} `json:"info"`
-	InstructionType string                 `json:"type"`
+	Info            map[string]any `json:"info"`
+	InstructionType string         `json:"type"`
 }
 
 type TransactionOpts struct {
@@ -560,4 +646,4 @@ func (opts *TransactionOpts) ToMap() M {
 	return obj
 }
 
-type M map[string]interface{}
+type M map[string]any

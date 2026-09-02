@@ -99,7 +99,7 @@ func (inst *InitializeAccount2) GetSysVarRentPubkeyAccount() *ag_solanago.Accoun
 
 func (inst InitializeAccount2) Build() *Instruction {
 	return &Instruction{BaseVariant: ag_binary.BaseVariant{
-		Impl:   inst,
+		Impl:   &inst,
 		TypeID: ag_binary.TypeIDFromUint8(Instruction_InitializeAccount2),
 	}}
 }
@@ -118,7 +118,7 @@ func (inst *InitializeAccount2) Validate() error {
 	// Check whether all (required) parameters are set:
 	{
 		if inst.Owner == nil {
-			return errors.New("Owner parameter is not set")
+			return errors.New("owner parameter is not set")
 		}
 	}
 

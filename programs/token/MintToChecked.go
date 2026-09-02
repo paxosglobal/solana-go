@@ -132,7 +132,7 @@ func (inst *MintToChecked) GetAuthorityAccount() *ag_solanago.AccountMeta {
 
 func (inst MintToChecked) Build() *Instruction {
 	return &Instruction{BaseVariant: ag_binary.BaseVariant{
-		Impl:   inst,
+		Impl:   &inst,
 		TypeID: ag_binary.TypeIDFromUint8(Instruction_MintToChecked),
 	}}
 }
@@ -151,10 +151,10 @@ func (inst *MintToChecked) Validate() error {
 	// Check whether all (required) parameters are set:
 	{
 		if inst.Amount == nil {
-			return errors.New("Amount parameter is not set")
+			return errors.New("amount parameter is not set")
 		}
 		if inst.Decimals == nil {
-			return errors.New("Decimals parameter is not set")
+			return errors.New("decimals parameter is not set")
 		}
 	}
 

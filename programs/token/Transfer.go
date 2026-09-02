@@ -121,7 +121,7 @@ func (inst *Transfer) GetOwnerAccount() *ag_solanago.AccountMeta {
 
 func (inst Transfer) Build() *Instruction {
 	return &Instruction{BaseVariant: ag_binary.BaseVariant{
-		Impl:   inst,
+		Impl:   &inst,
 		TypeID: ag_binary.TypeIDFromUint8(Instruction_Transfer),
 	}}
 }
@@ -140,7 +140,7 @@ func (inst *Transfer) Validate() error {
 	// Check whether all (required) parameters are set:
 	{
 		if inst.Amount == nil {
-			return errors.New("Amount parameter is not set")
+			return errors.New("amount parameter is not set")
 		}
 	}
 

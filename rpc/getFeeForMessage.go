@@ -18,18 +18,43 @@ import (
 	"context"
 )
 
-// Get the fee the network will charge for a particular Message.
-//
-// **NEW**: This method is only available in solana-core v1.9 or newer. Please use
-// `getFees` for solana-core v1.8.
+// GetFeeForMessage returns the fee the network will charge for a particular Message.
 func (cl *Client) GetFeeForMessage(
 	ctx context.Context,
 	message string, // Base-64 encoded Message
 	commitment CommitmentType, // optional
 ) (out *GetFeeForMessageResult, err error) {
-	params := []interface{}{message}
-	if commitment != "" {
-		params = append(params, M{"commitment": commitment})
+	return cl.GetFeeForMessageWithOpts(ctx, message, &GetFeeForMessageOpts{Commitment: commitment})
+}
+
+// GetFeeForMessageOpts groups the optional configuration accepted by the
+// getFeeForMessage RPC.
+type GetFeeForMessageOpts struct {
+	Commitment CommitmentType
+
+	// The minimum slot that the request can be evaluated at.
+	MinContextSlot *uint64
+}
+
+// GetFeeForMessageWithOpts is the variant of GetFeeForMessage that accepts the
+// full optional configuration set, including MinContextSlot.
+func (cl *Client) GetFeeForMessageWithOpts(
+	ctx context.Context,
+	message string, // Base-64 encoded Message
+	opts *GetFeeForMessageOpts,
+) (out *GetFeeForMessageResult, err error) {
+	params := []any{message}
+	if opts != nil {
+		obj := M{}
+		if opts.Commitment != "" {
+			obj["commitment"] = opts.Commitment
+		}
+		if opts.MinContextSlot != nil {
+			obj["minContextSlot"] = *opts.MinContextSlot
+		}
+		if len(obj) > 0 {
+			params = append(params, obj)
+		}
 	}
 	err = cl.rpcClient.CallForInto(ctx, &out, "getFeeForMessage", params)
 	return

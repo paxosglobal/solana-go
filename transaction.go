@@ -21,15 +21,14 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/davecgh/go-spew/spew"
 	bin "github.com/gagliardetto/binary"
-	"github.com/gagliardetto/treeout"
-	"github.com/mr-tron/base58"
-	"go.uber.org/zap"
-
+	"github.com/gagliardetto/solana-go/base58"
 	"github.com/gagliardetto/solana-go/text"
+	"github.com/gagliardetto/treeout"
+	"go.uber.org/zap"
 )
 
 type Transaction struct {
@@ -37,6 +36,7 @@ type Transaction struct {
 	// The list is always of length `message.header.numRequiredSignatures` and not empty.
 	// The signature at index `i` corresponds to the public key at index
 	// `i` in `message.account_keys`. The first one is used as the transaction id.
+	// Wire: legacy/v0 = compact-u16 count + sigs + message; v1 = message + sigs.
 	Signatures []Signature `json:"signatures"`
 
 	// Defines the content of the transaction.
@@ -88,9 +88,19 @@ func TransactionFromDecoder(decoder *bin.Decoder) (*Transaction, error) {
 	return out, nil
 }
 
+// TransactionFromBytes decodes a transaction from the whole slice.
+// For v1, trailing bytes are rejected (SIMD-0385); legacy/v0 stay lenient.
+// Streaming callers can use TransactionFromDecoder, which is always lenient.
 func TransactionFromBytes(data []byte) (*Transaction, error) {
 	decoder := bin.NewBinDecoder(data)
-	return TransactionFromDecoder(decoder)
+	tx, err := TransactionFromDecoder(decoder)
+	if err != nil {
+		return nil, err
+	}
+	if tx.Message.version == MessageVersionV1 && decoder.Remaining() > 0 {
+		return nil, fmt.Errorf("v1 transaction: %d trailing bytes after signatures", decoder.Remaining())
+	}
+	return tx, nil
 }
 
 func TransactionFromBase64(b64 string) (*Transaction, error) {
@@ -165,6 +175,8 @@ type TransactionOption interface {
 type transactionOptions struct {
 	payer         PublicKey
 	addressTables map[PublicKey]PublicKeySlice // [tablePubkey]addresses
+	version       MessageVersion               // requested message version; zero value = auto (legacy, or v0 if lookups are used)
+	config        TransactionConfig            // v1 only
 }
 
 type transactionOptionFunc func(opts *transactionOptions)
@@ -179,6 +191,20 @@ func TransactionPayer(payer PublicKey) TransactionOption {
 
 func TransactionAddressTables(tables map[PublicKey]PublicKeySlice) TransactionOption {
 	return transactionOptionFunc(func(opts *transactionOptions) { opts.addressTables = tables })
+}
+
+// TransactionMessageVersion selects the message version built by NewTransaction.
+// V1 rejects address tables and ComputeBudget instructions; prefer TransactionV1Config.
+func TransactionMessageVersion(version MessageVersion) TransactionOption {
+	return transactionOptionFunc(func(opts *transactionOptions) { opts.version = version })
+}
+
+// TransactionV1Config sets the v1 inline compute budget and implies MessageVersionV1.
+func TransactionV1Config(config TransactionConfig) TransactionOption {
+	return transactionOptionFunc(func(opts *transactionOptions) {
+		opts.config = config
+		opts.version = MessageVersionV1
+	})
 }
 
 var debugNewTransaction = false
@@ -219,6 +245,18 @@ func (builder *TransactionBuilder) SetFeePayer(feePayer PublicKey) *TransactionB
 	return builder
 }
 
+// SetVersion selects the message version (see TransactionMessageVersion).
+func (builder *TransactionBuilder) SetVersion(version MessageVersion) *TransactionBuilder {
+	builder.opts = append(builder.opts, TransactionMessageVersion(version))
+	return builder
+}
+
+// SetTransactionConfig sets the v1 inline compute budget (see TransactionV1Config).
+func (builder *TransactionBuilder) SetTransactionConfig(config TransactionConfig) *TransactionBuilder {
+	builder.opts = append(builder.opts, TransactionV1Config(config))
+	return builder
+}
+
 // Build builds and returns a *Transaction.
 func (builder *TransactionBuilder) Build() (*Transaction, error) {
 	return NewTransaction(
@@ -243,6 +281,24 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 		opt.apply(&options)
 	}
 
+	switch options.version {
+	case MessageVersionLegacy, MessageVersionV0:
+		if !options.config.IsEmpty() {
+			return nil, fmt.Errorf("TransactionV1Config requires MessageVersionV1 (got version %d)", options.version)
+		}
+	case MessageVersionV1:
+		if len(options.addressTables) > 0 {
+			return nil, fmt.Errorf("v1 transactions do not support address lookup tables; drop TransactionAddressTables or use v0")
+		}
+		for i, ix := range instructions {
+			if ix.ProgramID().Equals(ComputeBudget) {
+				return nil, fmt.Errorf("instruction %d: ComputeBudget instructions are no-ops in v1 transactions; use TransactionV1Config", i)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("invalid message version: %d", options.version)
+	}
+
 	feePayer := options.payer
 	if feePayer.IsZero() {
 		found := false
@@ -254,12 +310,24 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 			}
 		}
 		if !found {
-			return nil, fmt.Errorf("cannot determine fee payer. You can ether pass the fee payer via the 'TransactionWithInstructions' option parameter or it falls back to the first instruction's first signer")
+			return nil, fmt.Errorf("cannot determine fee payer. You can either pass the fee payer via the 'TransactionWithInstructions' option parameter or it falls back to the first instruction's first signer")
 		}
 	}
 
-	addressLookupKeysMap := make(map[PublicKey]addressTablePubkeyWithIndex) // all accounts from tables as map
-	for addressTablePubKey, addressTable := range options.addressTables {
+	totalTableEntries := 0
+	for _, t := range options.addressTables {
+		totalTableEntries += len(t)
+	}
+	addressLookupKeysMap := make(map[PublicKey]addressTablePubkeyWithIndex, totalTableEntries) // all accounts from tables as map
+	sortedTableKeys := make(PublicKeySlice, 0, len(options.addressTables))
+	for k := range options.addressTables {
+		sortedTableKeys = append(sortedTableKeys, k)
+	}
+	slices.SortFunc(sortedTableKeys, func(a, b PublicKey) int {
+		return bytes.Compare(a[:], b[:])
+	})
+	for _, addressTablePubKey := range sortedTableKeys {
+		addressTable := options.addressTables[addressTablePubKey]
 		if len(addressTable) > 256 {
 			return nil, fmt.Errorf("max lookup table index exceeded for %s table", addressTablePubKey)
 		}
@@ -277,8 +345,12 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 		}
 	}
 
-	programIDs := make(PublicKeySlice, 0)
-	accounts := []*AccountMeta{}
+	totalAccounts := 0
+	for _, instruction := range instructions {
+		totalAccounts += len(instruction.Accounts())
+	}
+	programIDs := make(PublicKeySlice, 0, len(instructions))
+	accounts := make([]*AccountMeta, 0, totalAccounts+len(instructions))
 	for _, instruction := range instructions {
 		accounts = append(accounts, instruction.Accounts()...)
 		programIDs.UniqueAppend(instruction.ProgramID())
@@ -298,12 +370,26 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 	}
 
 	// Sort. Prioritizing first by signer, then by writable
-	sort.SliceStable(accounts, func(i, j int) bool {
-		return accounts[i].less(accounts[j])
+	slices.SortStableFunc(accounts, func(a, b *AccountMeta) int {
+		if a.less(b) {
+			return -1
+		}
+		if b.less(a) {
+			return 1
+		}
+		return 0
 	})
 
-	uniqAccountsMap := map[PublicKey]uint64{}
-	uniqAccounts := []*AccountMeta{}
+	// Hint the map only above a threshold: for small txs, an empty map is
+	// cheaper than a single pre-allocated bucket (~640B for PublicKey keys).
+	// For larger txs, the hint avoids several bucket-grow operations.
+	var uniqAccountsMap map[PublicKey]uint64
+	if len(accounts) > 16 {
+		uniqAccountsMap = make(map[PublicKey]uint64, len(accounts))
+	} else {
+		uniqAccountsMap = map[PublicKey]uint64{}
+	}
+	uniqAccounts := make([]*AccountMeta, 0, len(accounts))
 	for _, acc := range accounts {
 		if index, found := uniqAccountsMap[acc.PublicKey]; found {
 			uniqAccounts[index].IsWritable = uniqAccounts[index].IsWritable || acc.IsWritable
@@ -412,7 +498,20 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 	if len(lookupsMap) > 0 {
 		lookups := make([]MessageAddressTableLookup, 0, len(lookupsMap))
 
-		for tablePubKey, l := range lookupsMap {
+		sortedLookupKeys := make(PublicKeySlice, 0, len(lookupsMap))
+		var totalWritable, totalReadonly int
+		for k, l := range lookupsMap {
+			sortedLookupKeys = append(sortedLookupKeys, k)
+			totalWritable += len(l.Writable)
+			totalReadonly += len(l.Readonly)
+		}
+		lookupsWritableKeys = make([]PublicKey, 0, totalWritable)
+		lookupsReadOnlyKeys = make([]PublicKey, 0, totalReadonly)
+		slices.SortFunc(sortedLookupKeys, func(a, b PublicKey) int {
+			return bytes.Compare(a[:], b[:])
+		})
+		for _, tablePubKey := range sortedLookupKeys {
+			l := lookupsMap[tablePubKey]
 			lookupsWritableKeys = append(lookupsWritableKeys, l.Writable...)
 			lookupsReadOnlyKeys = append(lookupsReadOnlyKeys, l.Readonly...)
 
@@ -426,23 +525,23 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 		// prevent error created in ResolveLookups
 		err := message.SetAddressTables(options.addressTables)
 		if err != nil {
-			return nil, fmt.Errorf("SetAddressTables: %s", err)
+			return nil, fmt.Errorf("SetAddressTables: %w", err)
 		}
 		message.SetAddressTableLookups(lookups)
 	}
 
 	var idx uint16
-	accountKeyIndex := make(map[string]uint16, len(message.AccountKeys)+len(lookupsWritableKeys)+len(lookupsReadOnlyKeys))
+	accountKeyIndex := make(map[PublicKey]uint16, len(message.AccountKeys)+len(lookupsWritableKeys)+len(lookupsReadOnlyKeys))
 	for _, acc := range message.AccountKeys {
-		accountKeyIndex[acc.String()] = idx
+		accountKeyIndex[acc] = idx
 		idx++
 	}
 	for _, acc := range lookupsWritableKeys {
-		accountKeyIndex[acc.String()] = idx
+		accountKeyIndex[acc] = idx
 		idx++
 	}
 	for _, acc := range lookupsReadOnlyKeys {
-		accountKeyIndex[acc.String()] = idx
+		accountKeyIndex[acc] = idx
 		idx++
 	}
 
@@ -454,21 +553,34 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 		)
 	}
 
+	message.Instructions = make([]CompiledInstruction, 0, len(instructions))
 	for txIdx, instruction := range instructions {
 		accounts = instruction.Accounts()
 		accountIndex := make([]uint16, len(accounts))
 		for idx, acc := range accounts {
-			accountIndex[idx] = accountKeyIndex[acc.PublicKey.String()]
+			accountIndex[idx] = accountKeyIndex[acc.PublicKey]
 		}
 		data, err := instruction.Data()
 		if err != nil {
 			return nil, fmt.Errorf("unable to encode instructions [%d]: %w", txIdx, err)
 		}
 		message.Instructions = append(message.Instructions, CompiledInstruction{
-			ProgramIDIndex: accountKeyIndex[instruction.ProgramID().String()],
+			ProgramIDIndex: accountKeyIndex[instruction.ProgramID()],
 			Accounts:       accountIndex,
 			Data:           data,
 		})
+	}
+
+	switch options.version {
+	case MessageVersionV0:
+		message.version = MessageVersionV0
+	case MessageVersionV1:
+		message.version = MessageVersionV1
+		message.TransactionConfig = options.config
+		// Fail early on the SIMD-0385 structural limits.
+		if err := message.sanitizeV1(); err != nil {
+			return nil, fmt.Errorf("v1 transaction: %w", err)
+		}
 	}
 
 	return &Transaction{
@@ -484,16 +596,38 @@ func (tx *Transaction) MarshalBinary() ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode tx.Message to binary: %w", err)
 	}
 
-	var signatureCount []byte
-	bin.EncodeCompactU16Length(&signatureCount, len(tx.Signatures))
-	output := make([]byte, 0, len(signatureCount)+len(signatureCount)*64+len(messageContent))
-	output = append(output, signatureCount...)
-	for _, sig := range tx.Signatures {
-		output = append(output, sig[:]...)
+	signatures := tx.Signatures
+	if missing := int(tx.Message.Header.NumRequiredSignatures) - len(signatures); missing > 0 {
+		// append zero-valued dummy signatures to the transaction, without them
+		// the serialized transaction will be invalid.
+		// reference: https://github.com/solana-labs/solana-web3.js/blob/4e9988cfc561f3ed11f4c5016a29090a61d129a8/src/transaction/versioned.ts#L36
+		signatures = append(signatures, make([]Signature, missing)...)
 	}
-	output = append(output, messageContent...)
 
-	return output, nil
+	if tx.Message.version == MessageVersionV1 {
+		// V1: prefixed message, then exactly numRequiredSignatures signatures.
+		if numRequired := int(tx.Message.Header.NumRequiredSignatures); len(signatures) > numRequired {
+			return nil, fmt.Errorf("v1 transaction: %d signatures but header requires %d (the v1 wire format has no signature count)", len(signatures), numRequired)
+		}
+		binaryTx := make([]byte, 0, len(messageContent)+len(signatures)*64)
+		binaryTx = append(binaryTx, messageContent...)
+		for _, sig := range signatures {
+			binaryTx = append(binaryTx, sig[:]...)
+		}
+		return binaryTx, nil
+	}
+
+	var signaturesCountBytes []byte
+	bin.EncodeCompactU16Length(&signaturesCountBytes, len(signatures))
+
+	binaryTx := make([]byte, 0, len(signaturesCountBytes)+len(signatures)*64+len(messageContent))
+	binaryTx = append(binaryTx, signaturesCountBytes...)
+	for _, sig := range signatures {
+		binaryTx = append(binaryTx, sig[:]...)
+	}
+
+	binaryTx = append(binaryTx, messageContent...)
+	return binaryTx, nil
 }
 
 func (tx Transaction) MarshalWithEncoder(encoder *bin.Encoder) error {
@@ -505,20 +639,28 @@ func (tx Transaction) MarshalWithEncoder(encoder *bin.Encoder) error {
 }
 
 func (tx *Transaction) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
+	// First byte: compact-u16 signature count (< 0x80) for legacy/v0, 0x81 for v1.
+	first, err := decoder.Peek(1)
+	if err != nil {
+		return fmt.Errorf("unable to peek transaction discriminator: %w", err)
+	}
+	if first[0] == messageVersionV1Prefix {
+		return tx.unmarshalV1(decoder)
+	}
+	if first[0]&messageVersionPrefix != 0 {
+		return fmt.Errorf("invalid transaction discriminator: 0x%02x", first[0])
+	}
 	{
 		numSignatures, err := decoder.ReadCompactU16()
 		if err != nil {
 			return fmt.Errorf("unable to read numSignatures: %w", err)
-		}
-		if numSignatures < 0 {
-			return fmt.Errorf("numSignatures is negative")
 		}
 		if numSignatures > decoder.Remaining()/64 {
 			return fmt.Errorf("numSignatures %d is too large for remaining bytes %d", numSignatures, decoder.Remaining())
 		}
 
 		tx.Signatures = make([]Signature, numSignatures)
-		for i := 0; i < numSignatures; i++ {
+		for i := range numSignatures {
 			_, err := decoder.Read(tx.Signatures[i][:])
 			if err != nil {
 				return fmt.Errorf("unable to read tx.Signatures[%d]: %w", i, err)
@@ -529,6 +671,31 @@ func (tx *Transaction) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
 		err := tx.Message.UnmarshalWithDecoder(decoder)
 		if err != nil {
 			return fmt.Errorf("unable to decode tx.Message: %w", err)
+		}
+		// v1 message in a legacy/v0 envelope is malformed (upstream #566).
+		if tx.Message.version == MessageVersionV1 {
+			return fmt.Errorf("invalid message version: v1 message in a legacy/v0 transaction envelope")
+		}
+	}
+	return nil
+}
+
+// unmarshalV1 decodes a v1 transaction: message, then numRequiredSignatures signatures.
+func (tx *Transaction) unmarshalV1(decoder *bin.Decoder) error {
+	if err := tx.Message.UnmarshalV1(decoder); err != nil {
+		return fmt.Errorf("unable to decode tx.Message: %w", err)
+	}
+	numSignatures := int(tx.Message.Header.NumRequiredSignatures)
+	if numSignatures > len(tx.Message.AccountKeys) {
+		return fmt.Errorf("v1 transaction: header requires %d signatures but only %d account keys", numSignatures, len(tx.Message.AccountKeys))
+	}
+	if numSignatures*64 > decoder.Remaining() {
+		return fmt.Errorf("v1 transaction: header requires %d signatures (%d bytes) but only %d bytes remain", numSignatures, numSignatures*64, decoder.Remaining())
+	}
+	tx.Signatures = make([]Signature, numSignatures)
+	for i := range tx.Signatures {
+		if _, err := decoder.Read(tx.Signatures[i][:]); err != nil {
+			return fmt.Errorf("unable to read tx.Signatures[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -637,7 +804,6 @@ func (tx *Transaction) EncodeToTree(parent treeout.Branches) {
 						message.Child(spew.Sdump(decodedInstruction))
 					}
 				} else {
-					// TODO: log error?
 					message.Child(fmt.Sprintf(text.RedBG("cannot decode instruction for %s program: %s"), progKey, err)).
 						Child(text.IndigoBG("Program") + ": " + text.Bold("<unknown>") + " " + text.ColorizeBG(progKey.String())).
 						//
@@ -767,38 +933,25 @@ func countWriteableAccounts(tx *Transaction) (count int) {
 		}
 		return count
 	}
-	numStatisKeys := len(tx.Message.AccountKeys)
-	statisKeys := tx.Message.AccountKeys
+	numStaticKeys := tx.Message.numStaticAccounts()
 	h := tx.Message.Header
-	for _, key := range statisKeys {
-		accIndex, ok := getStaticAccountIndex(tx, key)
-		if !ok {
-			continue
-		}
-		index := int(accIndex)
-		is := false
-		if index >= int(h.NumRequiredSignatures) {
-			// unsignedAccountIndex < numWritableUnsignedAccounts
-			is = index-int(h.NumRequiredSignatures) < (numStatisKeys-int(h.NumRequiredSignatures))-int(h.NumReadonlyUnsignedAccounts)
-		} else {
-			is = index < int(h.NumRequiredSignatures-h.NumReadonlySignedAccounts)
-		}
-		if is {
-			count++
-		}
-	}
-	if tx.Message.IsResolved() {
-		return count
-	}
+	numSig := int(h.NumRequiredSignatures)
+	numWritableSigned := max(numSig-int(h.NumReadonlySignedAccounts), 0)
+	numWritableUnsigned := max(numStaticKeys-numSig-int(h.NumReadonlyUnsignedAccounts), 0)
+	count += numWritableSigned + numWritableUnsigned
 	count += tx.Message.NumWritableLookups()
 	return count
 }
 
-func getStaticAccountIndex(tx *Transaction, key PublicKey) (int, bool) {
-	for idx, a := range tx.Message.AccountKeys {
-		if a.Equals(key) {
-			return (idx), true
+func (tx *Transaction) IsVote() bool {
+	// is vote if any of the instructions are of the vote program
+	for _, inst := range tx.Message.Instructions {
+		progKey, err := tx.ResolveProgramIDIndex(inst.ProgramIDIndex)
+		if err == nil {
+			if progKey.Equals(VoteProgramID) {
+				return true
+			}
 		}
 	}
-	return -1, false
+	return false
 }

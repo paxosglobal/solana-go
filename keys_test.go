@@ -18,10 +18,12 @@
 package solana
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"flag"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -141,6 +143,78 @@ func TestPrivateKeyFromSolanaKeygenFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPrivateKeyFromBase58RejectsWrongSizedInput pins that arbitrary base58
+// strings whose decoded length is not 64 bytes are rejected with the
+// "invalid private key size" error. Issue #232 reported that
+// PrivateKeyFromBase58 silently accepted random/invalid input; the
+// size-check path is the first line of defense and is exercised here.
+// Sibling tests below cover the seed/public-key mismatch and off-curve paths.
+func TestPrivateKeyFromBase58RejectsWrongSizedInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		// "abc" decodes to 2 bytes via base58 — far below 64.
+		{"short_base58", "abc"},
+		// "1111111111" decodes to 9 zero bytes — also far below 64.
+		{"all_ones_short", "1111111111"},
+		// A 32-byte all-ones base58 string decodes to roughly 22 bytes,
+		// still nowhere near the 64-byte ed25519 private-key size.
+		{"medium_random", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := PrivateKeyFromBase58(tc.input)
+			require.Error(t, err, "expected error for %q", tc.input)
+			require.Contains(
+				t,
+				err.Error(),
+				"invalid private key size",
+				"expected size-mismatch error, got: %v",
+				err,
+			)
+		})
+	}
+}
+
+func TestPrivateKeyFromBase58RejectsMismatchedSeedAndPublicKey(t *testing.T) {
+	original := MustPrivateKeyFromBase58("66cDvko73yAf8LYvFMM3r8vF5vJtkk7JKMgEKwkmBC86oHdq41C7i1a2vS3zE1yCcdLLk6VUatUb32ZzVjSBXtRs")
+	require.Len(t, original, PrivateKeyLength)
+
+	tampered := append([]byte(nil), original...)
+	tampered[0] ^= 0xFF
+
+	valid, err := ValidatePrivateKey(tampered)
+	require.False(t, valid)
+	require.EqualError(t, err, "invalid private key: seed/public key mismatch")
+
+	_, err = PrivateKeyFromBase58(PrivateKey(tampered).String())
+	require.EqualError(t, err, "invalid private key: seed/public key mismatch")
+}
+
+func TestPrivateKeyFromBase58ReturnsDiagnosticForOffCurvePublicKey(t *testing.T) {
+	original := MustPrivateKeyFromBase58("66cDvko73yAf8LYvFMM3r8vF5vJtkk7JKMgEKwkmBC86oHdq41C7i1a2vS3zE1yCcdLLk6VUatUb32ZzVjSBXtRs")
+	require.Len(t, original, PrivateKeyLength)
+
+	tampered := append([]byte(nil), original...)
+	offCurve := make([]byte, ed25519.PublicKeySize)
+	found := false
+	for i := uint32(0); i < 100_000; i++ {
+		binary.LittleEndian.PutUint32(offCurve[:4], i)
+		if !IsOnCurve(offCurve) {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "expected to find an off-curve public key test vector")
+	copy(tampered[ed25519.SeedSize:], offCurve)
+
+	valid, err := ValidatePrivateKey(tampered)
+	require.False(t, valid)
+	require.EqualError(t, err, "invalid private key: seed/public key mismatch (provided public key is NOT on the ed25519 curve)")
 }
 
 func TestPublicKey_MarshalText(t *testing.T) {
@@ -417,6 +491,22 @@ func TestCreateWithSeed(t *testing.T) {
 		got, err := CreateWithSeed(PublicKey{}, "limber chicken: 4/45", PublicKey{})
 		require.NoError(t, err)
 		require.True(t, got.Equals(MustPublicKeyFromBase58("9h1HyLCW5dZnBVap8C5egQ9Z6pHyjsh5MNy83iPqqRuq")))
+	}
+	{
+		// An owner ending with the PDA marker must be rejected, matching
+		// solana-labs Pubkey::create_with_seed, so the derived address can
+		// never collide with a program-derived address.
+		var owner PublicKey
+		marker := []byte(PDA_MARKER)
+		copy(owner[PublicKeyLength-len(marker):], marker)
+
+		_, err := CreateWithSeed(PublicKey{}, "seed", owner)
+		require.ErrorIs(t, err, ErrIllegalOwner)
+	}
+	{
+		// A seed longer than MaxSeedLength is rejected.
+		_, err := CreateWithSeed(PublicKey{}, strings.Repeat("a", MaxSeedLength+1), PublicKey{})
+		require.ErrorIs(t, err, ErrMaxSeedLengthExceeded)
 	}
 }
 
