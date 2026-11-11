@@ -3282,3 +3282,4 @@ We encourage everyone to contribute, submit issues, PRs, discuss. Every kind of 
 ## Credits
 
 - Gopher logo was originally created by Takuya Ueda (https://twitter.com/tenntenn). Licensed under the Creative Commons 3.0 Attributions license.
+<!-- hoplites review smoke test -->
